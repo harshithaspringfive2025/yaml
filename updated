@@ -1,0 +1,156 @@
+name: Build and Deploy Mule Projects
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  get_changed_projects:
+    runs-on: ubuntu-latest
+    outputs:
+      projects: ${{ steps.detect.outputs.projects }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Detect changed MuleSoft projects
+        id: detect
+        run: |
+          echo "🔍 Detecting changed MuleSoft projects..."
+          BASE_SHA="${{ github.event.before }}"
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            BASE_SHA=$(git rev-list --max-parents=0 HEAD)
+          fi
+          HEAD_SHA="${{ github.sha }}"
+          echo "Comparing commits: $BASE_SHA -> $HEAD_SHA"
+          changed_dirs=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | cut -d/ -f1 | sort -u)
+
+          echo "Changed directories:"
+          echo "$changed_dirs"
+
+          valid_projects=()
+          for dir in $changed_dirs; do
+            if [[ -f "$dir/pom.xml" ]]; then
+              echo "✅ Found Mule project: $dir"
+              valid_projects+=("\"$dir\"")
+            fi
+          done
+
+          if [ ${#valid_projects[@]} -eq 0 ]; then
+            echo "⚠️ No Mule projects changed. Skipping build."
+            echo "projects=[]" >> $GITHUB_OUTPUT
+          else
+            json_output="[$(IFS=,; echo "${valid_projects[*]}")]"
+            echo "projects=$json_output" >> $GITHUB_OUTPUT
+          fi
+
+  build_and_deploy:
+    needs: get_changed_projects
+    if: ${{ needs.get_changed_projects.outputs.projects != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        project: ${{ fromJson(needs.get_changed_projects.outputs.projects) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: 11
+
+      - name: Determine deploy credentials based on commit author
+        id: set-creds
+        run: |
+          AUTHOR=$(git log -1 --pretty=format:'%an' | xargs)
+          echo "Commit author: '$AUTHOR'"
+
+          case "$AUTHOR" in
+            "Kumaran Raja"|"Kumaran")
+              DEPLOY_USER="${{ secrets.ANYPOINT_USER_KUMARAN }}"
+              DEPLOY_PASS="${{ secrets.ANYPOINT_PASS_KUMARAN }}"
+              ;;
+            "Mukesh")
+              DEPLOY_USER="${{ secrets.ANYPOINT_USER_MUKESH }}"
+              DEPLOY_PASS="${{ secrets.ANYPOINT_PASS_MUKESH }}"
+              ;;
+            "Harshitha"|"Harshitha S")
+              DEPLOY_USER="${{ secrets.ANYPOINT_USER_HARSHITHA }}"
+              DEPLOY_PASS="${{ secrets.ANYPOINT_PASS_HARSHITHA }}"
+              ;;
+            *)
+              echo "❌ Committer '$AUTHOR' is not allowed to deploy."
+              exit 1
+              ;;
+          esac
+
+          if [[ -z "$DEPLOY_USER" || -z "$DEPLOY_PASS" ]]; then
+            echo "❌ Missing Anypoint credentials for $AUTHOR"
+            exit 1
+          fi
+
+          echo "Deploying as $AUTHOR"
+          echo "ANYPOINT_USERNAME=$DEPLOY_USER" >> $GITHUB_ENV
+          echo "ANYPOINT_PASSWORD=$DEPLOY_PASS" >> $GITHUB_ENV
+
+      - name: Build Mule Project (JAR) - ${{ matrix.project }}
+        run: |
+          cd "${{ matrix.project }}"
+          echo "🔨 Building project: ${{ matrix.project }}"
+          mvn clean package -DskipTests -DattachMuleSources
+          echo "✅ Build complete."
+
+      - name: Debug target JARs - ${{ matrix.project }}
+        run: |
+          echo "📂 Checking target directory for artifacts..."
+          ls -la "${{ matrix.project }}/target" || exit 1
+
+      - name: Deploy to CloudHub - ${{ matrix.project }}
+        env:
+          ANYPOINT_USERNAME: ${{ env.ANYPOINT_USERNAME }}
+          ANYPOINT_PASSWORD: ${{ env.ANYPOINT_PASSWORD }}
+          ANYPOINT_ENVIRONMENT: ${{ secrets.ANYPOINT_ENVIRONMENT }}
+          ANYPOINT_REGION: ${{ secrets.ANYPOINT_REGION }}
+        run: |
+          cd "${{ matrix.project }}"
+          artifact=$(ls target/*.jar 2>/dev/null | grep -v "original" | grep -v "studio" | head -1)
+          if [[ -z "$artifact" ]]; then
+            echo "❌ No deployable artifact found in target/"
+            exit 1
+          fi
+          echo "🚀 Deploying $artifact to CloudHub as $ANYPOINT_USERNAME (Environment: $ANYPOINT_ENVIRONMENT)..."
+          mvn deploy -DmuleDeploy \
+            -Danypoint.username="$ANYPOINT_USERNAME" \
+            -Danypoint.password="$ANYPOINT_PASSWORD" \
+            -Danypoint.environment="$ANYPOINT_ENVIRONMENT" \
+            -Danypoint.region="$ANYPOINT_REGION" \
+            -DskipTests -X
+
+      - name: Upload Studio Importable JAR - ${{ matrix.project }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-jar-${{ matrix.project }}
+          path: |
+            ${{ matrix.project }}/target/*-studio.jar
+        continue-on-error: true
+      - name: Echo Studio JAR Upload
+        run: echo "📦 Studio-importable JAR for ${{ matrix.project }} uploaded."
